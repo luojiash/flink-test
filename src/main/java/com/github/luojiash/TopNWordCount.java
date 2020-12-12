@@ -4,16 +4,20 @@ import org.apache.commons.lang3.time.DateUtils;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 
-import java.util.Date;
+import java.util.*;
 
 /**
  * Implements a streaming windowed version of the "WordCount" program.
@@ -76,6 +80,7 @@ public class TopNWordCount {
         DataStream<WordWithCount> aggStream = windowCounts
                 .keyBy(value -> value.word)
                 .window(SlidingEventTimeWindows.of(Time.minutes(1), Time.seconds(5)))
+                .allowedLateness(Time.minutes(1))
 
                 .aggregate(new AggregateFunction<WordWithCount, Long, Long>() {
                     @Override
@@ -104,9 +109,61 @@ public class TopNWordCount {
                     }
                 });
 
+        DataStream<String> topStream = aggStream
+                .keyBy(value -> value.date)
+                .process(new KeyedProcessFunction<Date, WordWithCount, String>() {
+
+                    private MapState<String, WordWithCount> mapState;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        mapState = getRuntimeContext().getMapState(
+                                new MapStateDescriptor<String, WordWithCount>("wordCountMap", String.class, WordWithCount.class)
+                        );
+                    }
+
+                    @Override
+                    public void processElement(WordWithCount value, Context ctx, Collector<String> out) throws Exception {
+
+                        mapState.put(value.word, value);
+                        ctx.timerService().registerEventTimeTimer(value.date.getTime());
+                        ctx.timerService().registerEventTimeTimer(value.date.getTime() + 60 * 1000); // 用于清空窗口状态
+                    }
+
+                    @Override
+                    public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
+
+                        if (timestamp == ctx.getCurrentKey().getTime() + 60 * 1000) {
+                            // 清空状态
+                            mapState.clear();
+                            return;
+                        }
+
+                        PriorityQueue<WordWithCount> queue = new PriorityQueue<>(
+                                (o1, o2) -> Comparator.<WordWithCount>comparingLong(w -> w.count).reversed().compare(o1, o2)
+                        );
+                        mapState.entries().forEach(e -> queue.add(e.getValue()));
+
+                        List<WordWithCount> list = new ArrayList<>();
+                        for (int i = 0; i < 5; i++) {
+                            WordWithCount next = queue.poll();
+                            if (next == null) break;
+                            list.add(next);
+                        }
+
+                        StringBuilder sb = new StringBuilder(new Date(timestamp).toString()).append("\n");
+                        for (int i = 0; i < list.size(); i++) {
+                            WordWithCount wordWithCount = list.get(i);
+                            sb.append(i + 1).append(". ").append(wordWithCount.word).append(": ").append(wordWithCount.count).append("\n");
+                        }
+                        out.collect(sb.toString());
+                    }
+                });
+
         // print the results with a single thread, rather than in parallel
         windowCounts.print("data").setParallelism(1);
         aggStream.print("agg").setParallelism(1);
+        topStream.print("top").setParallelism(1);
 
         env.execute("Socket Window WordCount");
     }
